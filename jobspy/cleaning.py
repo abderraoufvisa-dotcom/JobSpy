@@ -10,7 +10,7 @@ import pandas as pd
 from dateutil import parser as date_parser
 
 from jobspy.config import default_config, Config
-from jobspy.constants import CURRENCY_RATES_DEFAULT
+from jobspy.constants import CURRENCY_RATES_DEFAULT, COMMISSION_ONLY_KEYWORDS
 from jobspy.util import extract_salary, plain_converter
 
 
@@ -43,21 +43,25 @@ def _normalize_url(u: Optional[str]) -> Optional[str]:
 
 
 def generate_job_id(
-    canonical_url: Optional[str],
+    canonical_job_url: Optional[str],
     job_url_direct: Optional[str],
+    job_url: Optional[str],
     company: Optional[str],
     title: Optional[str],
     location_str: Optional[str],
     date_posted: Optional[date],
 ) -> str:
-    """Generate SHA1 job id using canonical_url if present else fallback signature."""
+    """Generate SHA1 job id using canonical_job_url if present else fallback signature."""
+
     def sha1(s: str) -> str:
         return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
-    if canonical_url:
-        return sha1(canonical_url)
+    if canonical_job_url:
+        return sha1(canonical_job_url)
     if job_url_direct:
         return sha1(job_url_direct)
+    if job_url:
+        return sha1(job_url)
     # fallback
     parts = [company or "", title or "", location_str or "", date_posted.isoformat() if date_posted else ""]
     sig = "|".join([_normalize_text(p).lower() if p else "" for p in parts])
@@ -88,6 +92,7 @@ def _convert_salary_to_monthly_min_max(
 ) -> Tuple[Optional[float], Optional[float]]:
     if interval is None or (min_amount is None and max_amount is None):
         return None, None
+
     def conv_to_month(val: float) -> float:
         if interval == "yearly":
             return val / 12.0
@@ -115,6 +120,34 @@ def _extract_currency_rate(currency: Optional[str], cfg: Config) -> Optional[flo
     return rates.get(cur)
 
 
+def _is_commission_only(description: str, cfg: Config) -> bool:
+    if not description:
+        return False
+    d = description.lower()
+    # If description contains explicit positive base salary indicators, don't treat as commission-only
+    if "base" in d or "salary" in d or "$" in d or "£" in d or "€" in d:
+        # but some phrases like "no base" indicate commission-only; handle negatives below
+        # check for explicit commission-only strong phrases
+        for kw in COMMISSION_ONLY_KEYWORDS:
+            if kw in d:
+                # if keyword present but there is also explicit base mentioned (e.g., "base $2000 + commission"), it's not commission-only
+                # We already returned False if "base" or currency symbols present; but ensure phrases like "no base" are handled
+                if "no base" in d or "no base salary" in d or "no base" in d:
+                    return True
+                # check for strong patterns like "100% commission"
+                if kw in ("100% commission", "pure commission", "commission-only"):
+                    return True
+                # else, if keyword present but there is explicit base number, do not mark as commission-only
+                # therefore continue scanning
+        # if we found currency or base mention, assume not commission-only
+        return False
+    # if no base/currency mention, but commission keywords like "commission only" present -> commission-only
+    for kw in COMMISSION_ONLY_KEYWORDS:
+        if kw in d:
+            return True
+    return False
+
+
 def normalize_row(raw_row: Dict[str, Any], cfg: Optional[Config] = None) -> Dict[str, Any]:
     """Normalize a single job row (dictionary) and return normalized dictionary with added fields."""
     cfg = cfg or default_config()
@@ -135,8 +168,10 @@ def normalize_row(raw_row: Dict[str, Any], cfg: Optional[Config] = None) -> Dict
     description_plain = plain_converter(description) if description else None
 
     # Normalize urls
-    canonical_url = _normalize_url(row.get("company_url_direct") or row.get("job_url_direct") or row.get("job_url"))
-    job_url_direct = _normalize_url(row.get("job_url_direct"))
+    # Prefer a canonical job URL field if present (canonical_job_url or canonical_url).
+    canonical_job_url = _normalize_url(row.get("canonical_job_url") or row.get("canonical_url"))
+    job_url_direct = _normalize_url(row.get("job_url_direct") or row.get("job_url"))
+    # job_url field still preserved separately
     job_url = _normalize_url(row.get("job_url"))
 
     # Dates
@@ -160,7 +195,7 @@ def normalize_row(raw_row: Dict[str, Any], cfg: Optional[Config] = None) -> Dict
     else:
         location_str = _normalize_text(location_raw) if location_raw else None
 
-    # Compensation parse: if compensation object exists, use it; else leave for extract_salary
+    # Compensation parse: if compensation object exists, use it; else try description extraction
     salary_interval = None
     salary_min = None
     salary_max = None
@@ -169,7 +204,6 @@ def normalize_row(raw_row: Dict[str, Any], cfg: Optional[Config] = None) -> Dict
     compensation_obj = row.get("compensation")
     if compensation_obj and isinstance(compensation_obj, dict):
         interval = compensation_obj.get("interval")
-        # interval might be enum or string
         if hasattr(interval, "value"):
             interval_val = interval.value
         else:
@@ -181,8 +215,8 @@ def normalize_row(raw_row: Dict[str, Any], cfg: Optional[Config] = None) -> Dict
         salary_source = "DIRECT_DATA"
     else:
         # try description extraction
-        if row.get("description"):
-            interval, smin, smax, currency = extract_salary(str(row.get("description")))
+        if description:
+            interval, smin, smax, currency = extract_salary(str(description))
             if interval or smin or smax:
                 salary_interval = interval
                 salary_min = smin
@@ -200,24 +234,22 @@ def normalize_row(raw_row: Dict[str, Any], cfg: Optional[Config] = None) -> Dict
             usd_monthly_min = monthly_min * rate if monthly_min is not None else None
             usd_monthly_max = monthly_max * rate if monthly_max is not None else None
 
-    # Commission detection (simple)
-    description_l = (description or "").lower()
-    commission_only = any(k in description_l for k in ["commission only", "100% commission", "pure commission", "commission-only"]) or any(k in ((row.get("listing_type") or "") or "").lower() for k in ["commission only"]) 
+    # Commission detection (use configured keywords)
+    desc_l = (description or "").lower()
+    commission_only = _is_commission_only(desc_l, cfg)
 
     # Contractor signals
-    contractor_signals = []
-    for kw in cfg.SALES_BLACKLIST:  # reuse blacklist? no, use CONTRACTOR keywords from constants if available
-        pass
-    # minimal contractor detection from description
+    contractor_signals: List[str] = []
     from jobspy.constants import CONTRACTOR_KEYWORDS
+
     for kw in CONTRACTOR_KEYWORDS:
-        if kw in description_l:
+        if kw in desc_l:
             contractor_signals.append(kw)
 
     # timezone strings naive extraction
-    timezone_strings = []
-    for tz in ["CET", "CEST", "GMT", "BST", "EST", "EDT", "PST", "PDT", "UTC"]:
-        if tz.lower() in (description_l or ""):
+    timezone_strings: List[str] = []
+    for tz in ["CET", "CEST", "GMT", "BST", "EST", "EDT", "CST", "CDT", "PST", "PDT", "UTC"]:
+        if tz.lower() in (desc_l or ""):
             timezone_strings.append(tz)
 
     # sales_fields
@@ -234,7 +266,7 @@ def normalize_row(raw_row: Dict[str, Any], cfg: Optional[Config] = None) -> Dict
         "site": row.get("site"),
         "job_id": None,  # fill after
         "source_sites": [row.get("site")] if row.get("site") else [],
-        "canonical_url": canonical_url,
+        "canonical_job_url": canonical_job_url,
         "job_url": job_url,
         "job_url_direct": job_url_direct,
         "title": title,
@@ -264,7 +296,9 @@ def normalize_row(raw_row: Dict[str, Any], cfg: Optional[Config] = None) -> Dict
         "salary_monthly_max": monthly_max,
         "salary_monthly_min_usd": usd_monthly_min,
         "salary_monthly_max_usd": usd_monthly_max,
-        "salary_status": "UNKNOWN" if (salary_min is None and salary_max is None) else "KNOWN",
+        # availability vs qualification naming
+        "salary_availability": "KNOWN" if (salary_min is not None or salary_max is not None) else "UNKNOWN",
+        "salary_qualification": "UNKNOWN",
         "commission_only": commission_only,
         "contractor_signals": contractor_signals,
         "timezone_strings": timezone_strings,
@@ -274,8 +308,9 @@ def normalize_row(raw_row: Dict[str, Any], cfg: Optional[Config] = None) -> Dict
 
     # job_id
     normalized_job_id = generate_job_id(
-        canonical_url=canonical_url,
+        canonical_job_url=canonical_job_url,
         job_url_direct=job_url_direct,
+        job_url=job_url,
         company=company,
         title=title,
         location_str=location_str,
@@ -311,9 +346,10 @@ def deduplicate(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, List[str]]]:
     grouped = df2.groupby("job_id")
     rows: List[Dict[str, Any]] = []
     for job_id, group in grouped:
+        urls = list(group.apply(lambda r: r.get("job_url") or r.get("raw_job_dict", {}).get("job_url"), axis=1))
+        duplicates_map[job_id] = urls
         if len(group) == 1:
             rows.append(group.iloc[0].to_dict())
-            duplicates_map[job_id] = list(group.apply(lambda r: r.get("job_url") or r.get("raw_job_dict", {}).get("job_url"), axis=1))
         else:
             # merge source_sites and prefer canonical fields from the first non-null
             merged = group.iloc[0].to_dict()
@@ -324,11 +360,10 @@ def deduplicate(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, List[str]]]:
                     if s not in source_sites:
                         source_sites.append(s)
             merged["source_sites"] = source_sites
-            # choose canonical_url if any non-null exists
-            for col in ["canonical_url", "job_url_direct", "job_url", "title", "company_name"]:
+            # choose canonical_job_url if any non-null exists
+            for col in ["canonical_job_url", "job_url_direct", "job_url", "title", "company_name"]:
                 vals = group[col].dropna().unique().tolist()
                 merged[col] = vals[0] if vals else merged.get(col)
             rows.append(merged)
-            duplicates_map[job_id] = list(group.apply(lambda r: r.get("job_url") or r.get("raw_job_dict", {}).get("job_url"), axis=1))
     deduped = pd.DataFrame(rows)
     return deduped.reset_index(drop=True), duplicates_map
